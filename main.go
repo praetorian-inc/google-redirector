@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -10,24 +12,25 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
 func main() {
 	backendURL := getEnv("BACKEND_URL", "https://your-backend-server.com")
-	
+
 	target, err := url.Parse(backendURL)
 	if err != nil {
 		log.Fatalf("Failed to parse BACKEND_URL: %v", err)
 	}
 
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	
 	// Always skip TLS verification for simplicity
+	proxy := httputil.NewSingleHostReverseProxy(target)
+
 	proxy.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	
+
 	// Simple logging
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
@@ -78,59 +81,44 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
 	log.Printf("WebSocket upgrade request: %s %s", r.Method, r.URL.Path)
 
 	// Build backend WebSocket URL
-	backendURL := target.Scheme + "://" + target.Host + r.URL.Path
-	if r.URL.RawQuery != "" {
-		backendURL += "?" + r.URL.RawQuery
+	backendURL := &url.URL{
+		Scheme:   "ws",
+		Host:     target.Host,
+		Path:     r.URL.Path,
+		RawQuery: r.URL.RawQuery,
 	}
-
-	// Change scheme to ws/wss
-	backendURL = strings.Replace(backendURL, "https://", "wss://", 1)
-	backendURL = strings.Replace(backendURL, "http://", "ws://", 1)
+	if target.Scheme == "https" {
+		backendURL.Scheme = "wss"
+	}
 
 	log.Printf("Connecting to backend WebSocket: %s", backendURL)
 
 	// Connect to backend
-	backendConn, err := dialBackendWebSocket(backendURL, r)
+	backendConn, backendResp, err := dialBackendWebSocket(backendURL, r)
 	if err != nil {
-		log.Printf("Failed to connect to backend WebSocket: %v", err)
+		log.Printf("Backend WebSocket dial failed: %v", err)
 		http.Error(w, "Failed to connect to backend", http.StatusBadGateway)
 		return
 	}
 	defer backendConn.Close()
 
-	// Hijack the client connection
+	// Hijack client connection
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		log.Printf("HTTP Hijacking not supported")
-		http.Error(w, "HTTP Hijacking not supported", http.StatusInternalServerError)
+		log.Printf("Hijacking not supported")
+		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
 		return
 	}
 
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		log.Printf("Failed to hijack connection: %v", err)
+		log.Printf("Hijack failed: %v", err)
 		return
 	}
 	defer clientConn.Close()
 
 	// Send 101 Switching Protocols response to client
-	response := "HTTP/1.1 101 Switching Protocols\r\n"
-	response += "Upgrade: websocket\r\n"
-	response += "Connection: Upgrade\r\n"
-
-	// Forward Sec-WebSocket-Accept if present
-	if accept := r.Header.Get("Sec-WebSocket-Accept"); accept != "" {
-		response += "Sec-WebSocket-Accept: " + accept + "\r\n"
-	}
-
-	// Forward Sec-WebSocket-Protocol if present
-	if protocol := r.Header.Get("Sec-WebSocket-Protocol"); protocol != "" {
-		response += "Sec-WebSocket-Protocol: " + protocol + "\r\n"
-	}
-
-	response += "\r\n"
-
-	if _, err := clientConn.Write([]byte(response)); err != nil {
+	if err := writeSwitchingProtocols(clientConn, r, backendResp); err != nil {
 		log.Printf("Failed to send upgrade response: %v", err)
 		return
 	}
@@ -138,32 +126,16 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
 	log.Printf("WebSocket connection established, proxying data...")
 
 	// Bidirectional copy
-	done := make(chan struct{}, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	// Backend -> Client
-	go func() {
-		io.Copy(clientConn, backendConn)
-		done <- struct{}{}
-	}()
+	go pipe(backendConn, clientConn, "client→backend", &wg)
+	go pipe(clientConn, backendConn, "backend→client", &wg)
 
-	// Client -> Backend
-	go func() {
-		io.Copy(backendConn, clientConn)
-		done <- struct{}{}
-	}()
-
-	// Wait for either direction to close
-	<-done
-	log.Printf("WebSocket connection closed")
+	wg.Wait()
 }
 
-func dialBackendWebSocket(backendURL string, r *http.Request) (net.Conn, error) {
-	// Parse backend URL
-	u, err := url.Parse(backendURL)
-	if err != nil {
-		return nil, err
-	}
-
+func dialBackendWebSocket(u *url.URL, r *http.Request) (net.Conn, *http.Response, error) {
 	// Determine host and port
 	host := u.Host
 	if !strings.Contains(host, ":") {
@@ -177,7 +149,7 @@ func dialBackendWebSocket(backendURL string, r *http.Request) (net.Conn, error) 
 	// Dial TCP connection
 	conn, err := net.DialTimeout("tcp", host, 10*time.Second)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Wrap with TLS if wss
@@ -188,56 +160,106 @@ func dialBackendWebSocket(backendURL string, r *http.Request) (net.Conn, error) 
 		})
 		if err := tlsConn.Handshake(); err != nil {
 			conn.Close()
-			return nil, err
+			return nil, nil, err
 		}
 		conn = tlsConn
 	}
 
 	// Build WebSocket upgrade request
-	upgradeReq := "GET " + u.Path
-	if u.RawQuery != "" {
-		upgradeReq += "?" + u.RawQuery
+	req := &http.Request{
+		Method: "GET",
+		URL:    u,
+		Header: make(http.Header),
+		Host:   u.Host,
 	}
-	upgradeReq += " HTTP/1.1\r\n"
-	upgradeReq += "Host: " + u.Host + "\r\n"
-	upgradeReq += "Upgrade: websocket\r\n"
-	upgradeReq += "Connection: Upgrade\r\n"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
 
 	// Forward important headers
-	if key := r.Header.Get("Sec-WebSocket-Key"); key != "" {
-		upgradeReq += "Sec-WebSocket-Key: " + key + "\r\n"
-	}
-	if version := r.Header.Get("Sec-WebSocket-Version"); version != "" {
-		upgradeReq += "Sec-WebSocket-Version: " + version + "\r\n"
-	}
-	if protocol := r.Header.Get("Sec-WebSocket-Protocol"); protocol != "" {
-		upgradeReq += "Sec-WebSocket-Protocol: " + protocol + "\r\n"
-	}
-	if auth := r.Header.Get("Authorization"); auth != "" {
-		upgradeReq += "Authorization: " + auth + "\r\n"
+	req.Header.Set("Sec-WebSocket-Version", r.Header.Get("Sec-WebSocket-Version"))
+	req.Header.Set("Sec-WebSocket-Key", r.Header.Get("Sec-WebSocket-Key"))
+
+	if proto := r.Header.Get("Sec-WebSocket-Protocol"); proto != "" {
+		req.Header.Set("Sec-WebSocket-Protocol", proto)
 	}
 
-	upgradeReq += "\r\n"
+	if ext := r.Header.Get("Sec-WebSocket-Extensions"); ext != "" {
+		req.Header.Set("Sec-WebSocket-Extensions", ext)
+	}
+
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
 
 	// Send upgrade request
-	if _, err := conn.Write([]byte(upgradeReq)); err != nil {
+	if err := req.Write(conn); err != nil {
 		conn.Close()
-		return nil, err
+		return nil, nil, err
 	}
 
-	// Read upgrade response
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
+	// Read response
+	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
 	if err != nil {
 		conn.Close()
-		return nil, err
+		return nil, nil, err
 	}
 
-	response := string(buf[:n])
-	if !strings.Contains(response, "101") && !strings.Contains(response, "Switching Protocols") {
+	if resp.StatusCode != http.StatusSwitchingProtocols {
 		conn.Close()
-		return nil, err
+		return nil, nil, fmt.Errorf("expected 101, got %d", resp.StatusCode)
 	}
 
-	return conn, nil
+	return conn, resp, nil
+}
+
+func writeSwitchingProtocols(clientConn net.Conn, clientReq *http.Request, backendResp *http.Response) error {
+	accept := backendResp.Header.Get("Sec-WebSocket-Accept")
+	if accept == "" {
+		return fmt.Errorf("missing Sec-WebSocket-Accept from backend")
+	}
+
+	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Accept: " + accept + "\r\n"
+
+	// Forward protocol if both sides agree
+	if proto := clientReq.Header.Get("Sec-WebSocket-Protocol"); proto != "" {
+		backendProto := backendResp.Header.Get("Sec-WebSocket-Protocol")
+		if backendProto != "" && strings.Contains(proto, backendProto) {
+			resp += fmt.Sprintf("Sec-WebSocket-Protocol: %s\r\n", backendProto)
+		}
+	}
+
+	resp += "\r\n"
+
+	_, err := clientConn.Write([]byte(resp))
+	return err
+}
+
+func pipe(dst, src net.Conn, dir string, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	n, err := io.Copy(dst, src)
+
+	if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+		log.Printf("pipe %s error: %v (copied %d bytes)", dir, err, n)
+	} else {
+		log.Printf("pipe %s finished (copied %d bytes)", dir, n)
+	}
+
+	// 1. WebSocket close frame
+	_ = dst.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_, _ = dst.Write([]byte{0x88, 0x02, 0x03, 0xe8})
+
+	// 2. Full TLS shutdown (if applicable)
+	if tc, ok := dst.(*tls.Conn); ok {
+		_ = tc.Close() // sends + drains close_notify
+	} else {
+		// 3. For plain TCP: half-close + full close
+		if sc, ok := dst.(interface{ CloseWrite() error }); ok {
+			_ = sc.CloseWrite()
+		}
+		_ = dst.Close()
+	}
 }
