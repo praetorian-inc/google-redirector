@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
 	"io"
 	"log"
@@ -90,7 +91,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
 	log.Printf("Connecting to backend WebSocket: %s", backendURL)
 
 	// Connect to backend
-	backendConn, err := dialBackendWebSocket(backendURL, r)
+	backendConn, backendResp, err := dialBackendWebSocket(backendURL, r)
 	if err != nil {
 		log.Printf("Failed to connect to backend WebSocket: %v", err)
 		http.Error(w, "Failed to connect to backend", http.StatusBadGateway)
@@ -118,14 +119,17 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
 	response += "Upgrade: websocket\r\n"
 	response += "Connection: Upgrade\r\n"
 
-	// Forward Sec-WebSocket-Accept if present
-	if accept := r.Header.Get("Sec-WebSocket-Accept"); accept != "" {
-		response += "Sec-WebSocket-Accept: " + accept + "\r\n"
-	}
-
-	// Forward Sec-WebSocket-Protocol if present
-	if protocol := r.Header.Get("Sec-WebSocket-Protocol"); protocol != "" {
-		response += "Sec-WebSocket-Protocol: " + protocol + "\r\n"
+	// Forward Sec-WebSocket-Accept from backend response if present
+	if backendResp != nil {
+		if accept := backendResp.Header.Get("Sec-WebSocket-Accept"); accept != "" {
+			response += "Sec-WebSocket-Accept: " + accept + "\r\n"
+			log.Printf("Forwarding Sec-WebSocket-Accept: %s", accept)
+		}
+		// Forward Sec-WebSocket-Protocol from backend response if present
+		if protocol := backendResp.Header.Get("Sec-WebSocket-Protocol"); protocol != "" {
+			response += "Sec-WebSocket-Protocol: " + protocol + "\r\n"
+			log.Printf("Forwarding Sec-WebSocket-Protocol: %s", protocol)
+		}
 	}
 
 	response += "\r\n"
@@ -137,31 +141,41 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
 
 	log.Printf("WebSocket connection established, proxying data...")
 
-	// Bidirectional copy
-	done := make(chan struct{}, 2)
+	// Bidirectional copy with error handling
+	errChan := make(chan error, 2)
 
 	// Backend -> Client
 	go func() {
-		io.Copy(clientConn, backendConn)
-		done <- struct{}{}
+		_, err := io.Copy(clientConn, backendConn)
+		if err != nil {
+			log.Printf("Backend->Client copy error: %v", err)
+		}
+		errChan <- err
 	}()
 
 	// Client -> Backend
 	go func() {
-		io.Copy(backendConn, clientConn)
-		done <- struct{}{}
+		_, err := io.Copy(backendConn, clientConn)
+		if err != nil {
+			log.Printf("Client->Backend copy error: %v", err)
+		}
+		errChan <- err
 	}()
 
 	// Wait for either direction to close
-	<-done
-	log.Printf("WebSocket connection closed")
+	err := <-errChan
+	if err != nil {
+		log.Printf("WebSocket connection closed with error: %v", err)
+	} else {
+		log.Printf("WebSocket connection closed normally")
+	}
 }
 
-func dialBackendWebSocket(backendURL string, r *http.Request) (net.Conn, error) {
+func dialBackendWebSocket(backendURL string, r *http.Request) (net.Conn, *http.Response, error) {
 	// Parse backend URL
 	u, err := url.Parse(backendURL)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Determine host and port
@@ -177,7 +191,7 @@ func dialBackendWebSocket(backendURL string, r *http.Request) (net.Conn, error) 
 	// Dial TCP connection
 	conn, err := net.DialTimeout("tcp", host, 10*time.Second)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Wrap with TLS if wss
@@ -188,7 +202,7 @@ func dialBackendWebSocket(backendURL string, r *http.Request) (net.Conn, error) 
 		})
 		if err := tlsConn.Handshake(); err != nil {
 			conn.Close()
-			return nil, err
+			return nil, nil, err
 		}
 		conn = tlsConn
 	}
@@ -222,22 +236,23 @@ func dialBackendWebSocket(backendURL string, r *http.Request) (net.Conn, error) 
 	// Send upgrade request
 	if _, err := conn.Write([]byte(upgradeReq)); err != nil {
 		conn.Close()
-		return nil, err
+		return nil, nil, err
 	}
 
-	// Read upgrade response
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
+	// Read and parse upgrade response using bufio.Reader
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
 	if err != nil {
 		conn.Close()
-		return nil, err
+		return nil, nil, err
 	}
 
-	response := string(buf[:n])
-	if !strings.Contains(response, "101") && !strings.Contains(response, "Switching Protocols") {
+	if resp.StatusCode != 101 {
 		conn.Close()
-		return nil, err
+		return nil, nil, io.ErrUnexpectedEOF
 	}
 
-	return conn, nil
+	log.Printf("Backend responded with 101, Sec-WebSocket-Accept: %s", resp.Header.Get("Sec-WebSocket-Accept"))
+
+	return conn, resp, nil
 }
