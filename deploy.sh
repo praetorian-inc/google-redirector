@@ -15,7 +15,7 @@ echo "🚀 Deploying Google Redirector '$REDIRECTOR_NAME' to Google Cloud Run"
 
 if [ -z "$BACKEND_URL" ]; then
     echo "❌ Error: BACKEND_URL environment variable is not set"
-    echo "Example: export BACKEND_URL=https://your-backend.com"
+    echo "Example: export BACKEND_URL=https://funtones-orange.run.place"
     exit 1
 fi
 
@@ -27,7 +27,7 @@ fi
 
 echo "📋 Using GCP project: $PROJECT_ID"
 SERVICE_NAME="redirector-$REDIRECTOR_NAME"
-REGION=${GOOGLE_CLOUD_REGION:-"us-central1"}
+REGION=${GOOGLE_CLOUD_REGION:-"europe-west3"}
 REPO_NAME="google-redirector"
 IMAGE_NAME="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/$SERVICE_NAME"
 
